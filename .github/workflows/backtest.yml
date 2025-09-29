@@ -1,0 +1,406 @@
+name: Strategy Backtesting
+
+on:
+  workflow_dispatch:
+    inputs:
+      strategy:
+        description: 'Strategy to backtest'
+        required: true
+        default: 'moving_average_crossover'
+        type: choice
+        options:
+          - moving_average_crossover
+          - rsi_mean_reversion
+          - bollinger_bands
+          - macd_momentum
+          - multi_strategy
+          - all_strategies
+      
+      start_date:
+        description: 'Backtest start date (YYYY-MM-DD)'
+        required: true
+        default: '2024-01-01'
+        type: string
+      
+      end_date:
+        description: 'Backtest end date (YYYY-MM-DD)'
+        required: true
+        default: '2024-12-31'
+        type: string
+      
+      initial_balance:
+        description: 'Initial balance for backtesting'
+        required: false
+        default: '10000'
+        type: string
+      
+      symbol:
+        description: 'Trading symbol'
+        required: false
+        default: 'BTCUSD'
+        type: string
+      
+      timeframe:
+        description: 'Data timeframe'
+        required: false
+        default: '1h'
+        type: choice
+        options:
+          - 1m
+          - 5m
+          - 15m
+          - 1h
+          - 4h
+          - 1d
+      
+      commission:
+        description: 'Commission rate (0.001 = 0.1%)'
+        required: false
+        default: '0.001'
+        type: string
+
+  schedule:
+    # Run comprehensive backtesting every Sunday at 2 AM UTC
+    - cron: '0 2 * * 0'
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  validate_inputs:
+    runs-on: ubuntu-latest
+    outputs:
+      strategies: ${{ steps.strategy_list.outputs.strategies }}
+      start_date: ${{ steps.validate.outputs.start_date }}
+      end_date: ${{ steps.validate.outputs.end_date }}
+      initial_balance: ${{ steps.validate.outputs.initial_balance }}
+      commission: ${{ steps.validate.outputs.commission }}
+    
+    steps:
+      - name: Validate and process inputs
+        id: validate
+        run: |
+          # Validate dates
+          start_date="${{ github.event.inputs.start_date || '2024-01-01' }}"
+          end_date="${{ github.event.inputs.end_date || '2024-12-31' }}"
+          
+          if ! date -d "$start_date" >/dev/null 2>&1; then
+            echo "Invalid start date format"
+            exit 1
+          fi
+          
+          if ! date -d "$end_date" >/dev/null 2>&1; then
+            echo "Invalid end date format"
+            exit 1
+          fi
+          
+          if [[ "$start_date" > "$end_date" ]]; then
+            echo "Start date must be before end date"
+            exit 1
+          fi
+          
+          # Validate numeric inputs
+          initial_balance="${{ github.event.inputs.initial_balance || '10000' }}"
+          commission="${{ github.event.inputs.commission || '0.001' }}"
+          
+          if ! [[ "$initial_balance" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "Invalid initial balance format"
+            exit 1
+          fi
+          
+          if ! [[ "$commission" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "Invalid commission format"
+            exit 1
+          fi
+          
+          echo "start_date=$start_date" >> $GITHUB_OUTPUT
+          echo "end_date=$end_date" >> $GITHUB_OUTPUT
+          echo "initial_balance=$initial_balance" >> $GITHUB_OUTPUT
+          echo "commission=$commission" >> $GITHUB_OUTPUT
+      
+      - name: Determine strategies to test
+        id: strategy_list
+        run: |
+          strategy="${{ github.event.inputs.strategy || 'moving_average_crossover' }}"
+          
+          if [ "$strategy" = "all_strategies" ]; then
+            strategies='["moving_average_crossover", "rsi_mean_reversion", "bollinger_bands", "macd_momentum", "multi_strategy"]'
+          else
+            strategies='["'$strategy'"]'
+          fi
+          
+          echo "strategies=$strategies" >> $GITHUB_OUTPUT
+
+  backtest_strategy:
+    runs-on: ubuntu-latest
+    needs: validate_inputs
+    strategy:
+      matrix:
+        strategy: ${{ fromJson(needs.validate_inputs.outputs.strategies) }}
+      fail-fast: false
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          
+          # Install additional backtesting dependencies
+          pip install matplotlib seaborn plotly kaleido
+      
+      - name: Run backtest
+        env:
+          STRATEGY: ${{ matrix.strategy }}
+          START_DATE: ${{ needs.validate_inputs.outputs.start_date }}
+          END_DATE: ${{ needs.validate_inputs.outputs.end_date }}
+          INITIAL_BALANCE: ${{ needs.validate_inputs.outputs.initial_balance }}
+          COMMISSION: ${{ needs.validate_inputs.outputs.commission }}
+          SYMBOL: ${{ github.event.inputs.symbol || 'BTCUSD' }}
+          TIMEFRAME: ${{ github.event.inputs.timeframe || '1h' }}
+        run: |
+          python scripts/run_backtest.py \
+            --strategy "$STRATEGY" \
+            --start-date "$START_DATE" \
+            --end-date "$END_DATE" \
+            --initial-balance "$INITIAL_BALANCE" \
+            --commission "$COMMISSION" \
+            --symbol "$SYMBOL" \
+            --timeframe "$TIMEFRAME" \
+            --output-dir "backtest_results/$STRATEGY"
+      
+      - name: Generate backtest report
+        env:
+          STRATEGY: ${{ matrix.strategy }}
+        run: |
+          python scripts/generate_backtest_report.py \
+            --results-dir "backtest_results/$STRATEGY" \
+            --output-file "backtest_results/$STRATEGY/report.html"
+      
+      - name: Upload backtest results
+        uses: actions/upload-artifact@v3
+        with:
+          name: backtest-${{ matrix.strategy }}-${{ github.run_number }}
+          path: backtest_results/${{ matrix.strategy }}/
+          retention-days: 90
+
+  compare_strategies:
+    runs-on: ubuntu-latest
+    needs: [validate_inputs, backtest_strategy]
+    if: always() && needs.backtest_strategy.result != 'cancelled'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install matplotlib seaborn plotly kaleido
+      
+      - name: Download all backtest results
+        uses: actions/download-artifact@v3
+        with:
+          path: downloaded_results/
+      
+      - name: Organize results
+        run: |
+          mkdir -p comparison_results
+          
+          # Move all backtest results to a common directory
+          for dir in downloaded_results/backtest-*; do
+            if [ -d "$dir" ]; then
+              strategy_name=$(basename "$dir" | sed 's/backtest-\(.*\)-[0-9]*/\1/')
+              cp -r "$dir"/* "comparison_results/$strategy_name/" 2>/dev/null || true
+            fi
+          done
+      
+      - name: Generate comparison report
+        run: |
+          python scripts/compare_strategies.py \
+            --results-dir "comparison_results" \
+            --output-file "strategy_comparison.html" \
+            --metrics-file "strategy_metrics.json"
+      
+      - name: Create performance summary
+        run: |
+          python -c "
+          import json
+          import os
+          
+          if os.path.exists('strategy_metrics.json'):
+              with open('strategy_metrics.json', 'r') as f:
+                  metrics = json.load(f)
+              
+              # Create markdown summary
+              with open('BACKTEST_SUMMARY.md', 'w') as f:
+                  f.write('# Backtest Results Summary\n\n')
+                  f.write(f'**Date Range:** ${{ needs.validate_inputs.outputs.start_date }} to ${{ needs.validate_inputs.outputs.end_date }}\n')
+                  f.write(f'**Initial Balance:** \${{ needs.validate_inputs.outputs.initial_balance }}\n')
+                  f.write(f'**Commission:** ${{ needs.validate_inputs.outputs.commission }}\n\n')
+                  
+                  f.write('## Strategy Performance\n\n')
+                  f.write('| Strategy | Total Return | Sharpe Ratio | Max Drawdown | Win Rate |\n')
+                  f.write('|----------|--------------|--------------|--------------|----------|\n')
+                  
+                  for strategy, data in metrics.items():
+                      total_return = data.get('total_return', 0)
+                      sharpe_ratio = data.get('sharpe_ratio', 0)
+                      max_drawdown = data.get('max_drawdown', 0)
+                      win_rate = data.get('win_rate', 0)
+                      
+                      f.write(f'| {strategy} | {total_return:.2f}% | {sharpe_ratio:.2f} | {max_drawdown:.2f}% | {win_rate:.2f}% |\n')
+                  
+                  f.write('\n## Key Insights\n\n')
+                  
+                  # Find best performing strategy
+                  best_strategy = max(metrics.keys(), key=lambda k: metrics[k].get('total_return', 0))
+                  best_return = metrics[best_strategy].get('total_return', 0)
+                  
+                  f.write(f'- **Best Performing Strategy:** {best_strategy} ({best_return:.2f}% return)\n')
+                  
+                  # Find strategy with best Sharpe ratio
+                  best_sharpe_strategy = max(metrics.keys(), key=lambda k: metrics[k].get('sharpe_ratio', 0))
+                  best_sharpe = metrics[best_sharpe_strategy].get('sharpe_ratio', 0)
+                  
+                  f.write(f'- **Best Risk-Adjusted Return:** {best_sharpe_strategy} (Sharpe: {best_sharpe:.2f})\n')
+                  
+                  # Find strategy with lowest drawdown
+                  lowest_dd_strategy = min(metrics.keys(), key=lambda k: abs(metrics[k].get('max_drawdown', 0)))
+                  lowest_dd = metrics[lowest_dd_strategy].get('max_drawdown', 0)
+                  
+                  f.write(f'- **Lowest Drawdown:** {lowest_dd_strategy} ({lowest_dd:.2f}%)\n')
+          "
+      
+      - name: Upload comparison results
+        uses: actions/upload-artifact@v3
+        with:
+          name: strategy-comparison-${{ github.run_number }}
+          path: |
+            strategy_comparison.html
+            strategy_metrics.json
+            BACKTEST_SUMMARY.md
+          retention-days: 180
+      
+      - name: Comment on PR (if applicable)
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            
+            if (fs.existsSync('BACKTEST_SUMMARY.md')) {
+              const summary = fs.readFileSync('BACKTEST_SUMMARY.md', 'utf8');
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: summary
+              });
+            }
+
+  update_strategy_rankings:
+    runs-on: ubuntu-latest
+    needs: [compare_strategies]
+    if: github.ref == 'refs/heads/main' && needs.compare_strategies.result == 'success'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Download comparison results
+        uses: actions/download-artifact@v3
+        with:
+          name: strategy-comparison-${{ github.run_number }}
+      
+      - name: Update strategy rankings
+        run: |
+          # Create or update strategy rankings file
+          if [ -f "strategy_metrics.json" ]; then
+            cp strategy_metrics.json docs/latest_backtest_results.json
+            
+            # Update timestamp
+            echo "{\"last_updated\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"}" > docs/backtest_metadata.json
+          fi
+      
+      - name: Commit updated rankings
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          git add docs/latest_backtest_results.json docs/backtest_metadata.json
+          
+          if ! git diff --staged --quiet; then
+            git commit -m "Update strategy rankings from backtest - Run #${{ github.run_number }}"
+            git push
+          fi
+
+  notification:
+    runs-on: ubuntu-latest
+    needs: [validate_inputs, backtest_strategy, compare_strategies]
+    if: always()
+    
+    steps:
+      - name: Prepare notification
+        id: notification
+        run: |
+          if [ "${{ needs.compare_strategies.result }}" = "success" ]; then
+            echo "status=🟢 SUCCESS" >> $GITHUB_OUTPUT
+            echo "message=Backtest completed successfully" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.backtest_strategy.result }}" = "success" ]; then
+            echo "status=🟡 PARTIAL" >> $GITHUB_OUTPUT
+            echo "message=Backtest completed but comparison failed" >> $GITHUB_OUTPUT
+          else
+            echo "status=🔴 FAILED" >> $GITHUB_OUTPUT
+            echo "message=Backtest failed" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Send notification
+        if: env.DISCORD_WEBHOOK_URL != ''
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          curl -H "Content-Type: application/json" \
+               -X POST \
+               -d '{
+                 "embeds": [{
+                   "title": "Strategy Backtest - ${{ steps.notification.outputs.status }}",
+                   "description": "${{ steps.notification.outputs.message }}",
+                   "color": 3447003,
+                   "fields": [
+                     {
+                       "name": "Period",
+                       "value": "${{ needs.validate_inputs.outputs.start_date }} to ${{ needs.validate_inputs.outputs.end_date }}",
+                       "inline": true
+                     },
+                     {
+                       "name": "Strategies",
+                       "value": "${{ join(fromJson(needs.validate_inputs.outputs.strategies), ', ') }}",
+                       "inline": true
+                     },
+                     {
+                       "name": "Run",
+                       "value": "#${{ github.run_number }}",
+                       "inline": true
+                     }
+                   ],
+                   "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%S.000Z)'"
+                 }]
+               }' \
+               "$DISCORD_WEBHOOK_URL"

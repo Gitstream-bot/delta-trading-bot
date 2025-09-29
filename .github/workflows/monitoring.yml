@@ -1,0 +1,675 @@
+name: System Monitoring & Alerts
+
+on:
+  schedule:
+    # Run every 5 minutes during market hours for critical monitoring
+    - cron: '*/5 9-17 * * 1-5'
+    # Run every 30 minutes outside market hours
+    - cron: '*/30 0-8,18-23 * * *'
+    - cron: '*/30 * * * 0,6'
+  
+  workflow_dispatch:
+    inputs:
+      check_type:
+        description: 'Type of monitoring check'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - api_health
+          - performance
+          - risk_limits
+          - system_status
+      
+      alert_level:
+        description: 'Alert sensitivity level'
+        required: false
+        default: 'normal'
+        type: choice
+        options:
+          - low
+          - normal
+          - high
+          - critical
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  api_health_check:
+    runs-on: ubuntu-latest
+    outputs:
+      api_status: ${{ steps.health.outputs.status }}
+      api_latency: ${{ steps.health.outputs.latency }}
+      api_error: ${{ steps.health.outputs.error }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Check API health
+        id: health
+        env:
+          DELTA_API_KEY: ${{ secrets.DELTA_API_KEY }}
+          DELTA_API_SECRET: ${{ secrets.DELTA_API_SECRET }}
+          DELTA_BASE_URL: ${{ secrets.DELTA_BASE_URL }}
+        run: |
+          python -c "
+          import os
+          import sys
+          import time
+          import json
+          sys.path.append('src')
+          
+          from utils.config import Config
+          from api.delta_client import DeltaExchangeClient
+          from utils.logger import get_logger
+          
+          logger = get_logger('api_health')
+          
+          try:
+              if not os.getenv('DELTA_API_KEY'):
+                  print('status=no_credentials')
+                  print('latency=0')
+                  print('error=No API credentials configured')
+                  sys.exit(0)
+              
+              config = Config()
+              client = DeltaExchangeClient(config)
+              
+              # Measure API latency
+              start_time = time.time()
+              health_status = client.health_check()
+              latency = (time.time() - start_time) * 1000  # Convert to milliseconds
+              
+              if health_status:
+                  print(f'status=healthy')
+                  print(f'latency={latency:.2f}')
+                  print('error=')
+                  
+                  # Additional checks
+                  try:
+                      balance = client.get_account_balance()
+                      position = client.get_position()
+                      
+                      logger.info('✅ All API endpoints responding normally')
+                  except Exception as e:
+                      print(f'status=degraded')
+                      print(f'error=Some endpoints failing: {str(e)}')
+              else:
+                  print(f'status=unhealthy')
+                  print(f'latency={latency:.2f}')
+                  print('error=API health check failed')
+                  
+          except Exception as e:
+              print(f'status=error')
+              print('latency=0')
+              print(f'error={str(e)}')
+          " | while read line; do
+            echo "$line" >> $GITHUB_OUTPUT
+          done
+
+  performance_monitoring:
+    runs-on: ubuntu-latest
+    needs: api_health_check
+    outputs:
+      performance_status: ${{ steps.performance.outputs.status }}
+      current_pnl: ${{ steps.performance.outputs.current_pnl }}
+      drawdown: ${{ steps.performance.outputs.drawdown }}
+      risk_level: ${{ steps.performance.outputs.risk_level }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Check performance metrics
+        id: performance
+        env:
+          DELTA_API_KEY: ${{ secrets.DELTA_API_KEY }}
+          DELTA_API_SECRET: ${{ secrets.DELTA_API_SECRET }}
+          DELTA_BASE_URL: ${{ secrets.DELTA_BASE_URL }}
+          MAX_DRAWDOWN_ALERT: ${{ vars.MAX_DRAWDOWN_ALERT || '10' }}
+          MIN_PNL_ALERT: ${{ vars.MIN_PNL_ALERT || '-1000' }}
+        run: |
+          python -c "
+          import os
+          import sys
+          import json
+          from decimal import Decimal
+          sys.path.append('src')
+          
+          from utils.config import Config
+          from api.delta_client import DeltaExchangeClient
+          from utils.logger import get_logger
+          
+          logger = get_logger('performance_monitoring')
+          
+          try:
+              if not os.getenv('DELTA_API_KEY'):
+                  print('status=no_data')
+                  print('current_pnl=0')
+                  print('drawdown=0')
+                  print('risk_level=unknown')
+                  sys.exit(0)
+              
+              config = Config()
+              client = DeltaExchangeClient(config)
+              
+              # Get current balance and position
+              balance_info = client.get_account_balance()
+              position_info = client.get_position()
+              
+              # Load historical performance data
+              performance_file = 'logs/performance_metrics.json'
+              if os.path.exists(performance_file):
+                  with open(performance_file, 'r') as f:
+                      metrics = json.load(f)
+              else:
+                  metrics = {}
+              
+              current_pnl = metrics.get('total_pnl', 0)
+              max_drawdown = metrics.get('max_drawdown', 0)
+              
+              # Determine risk level
+              max_dd_threshold = float(os.getenv('MAX_DRAWDOWN_ALERT', 10))
+              min_pnl_threshold = float(os.getenv('MIN_PNL_ALERT', -1000))
+              
+              if abs(max_drawdown) > max_dd_threshold:
+                  risk_level = 'high'
+              elif current_pnl < min_pnl_threshold:
+                  risk_level = 'medium'
+              else:
+                  risk_level = 'low'
+              
+              # Determine overall status
+              if risk_level == 'high':
+                  status = 'alert'
+              elif risk_level == 'medium':
+                  status = 'warning'
+              else:
+                  status = 'normal'
+              
+              print(f'status={status}')
+              print(f'current_pnl={current_pnl}')
+              print(f'drawdown={max_drawdown}')
+              print(f'risk_level={risk_level}')
+              
+              logger.info(f'Performance check: PnL={current_pnl}, Drawdown={max_drawdown}%, Risk={risk_level}')
+              
+          except Exception as e:
+              logger.error(f'Performance monitoring error: {str(e)}')
+              print('status=error')
+              print('current_pnl=0')
+              print('drawdown=0')
+              print('risk_level=unknown')
+          " | while read line; do
+            echo "$line" >> $GITHUB_OUTPUT
+          done
+
+  risk_limit_monitoring:
+    runs-on: ubuntu-latest
+    needs: [api_health_check, performance_monitoring]
+    outputs:
+      risk_status: ${{ steps.risk.outputs.status }}
+      position_size: ${{ steps.risk.outputs.position_size }}
+      leverage: ${{ steps.risk.outputs.leverage }}
+      open_orders: ${{ steps.risk.outputs.open_orders }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Check risk limits
+        id: risk
+        env:
+          DELTA_API_KEY: ${{ secrets.DELTA_API_KEY }}
+          DELTA_API_SECRET: ${{ secrets.DELTA_API_SECRET }}
+          DELTA_BASE_URL: ${{ secrets.DELTA_BASE_URL }}
+          MAX_POSITION_SIZE: ${{ vars.MAX_POSITION_SIZE || '1000' }}
+          MAX_LEVERAGE: ${{ vars.MAX_LEVERAGE || '10' }}
+          MAX_OPEN_ORDERS: ${{ vars.MAX_OPEN_ORDERS || '5' }}
+        run: |
+          python -c "
+          import os
+          import sys
+          sys.path.append('src')
+          
+          from utils.config import Config
+          from api.delta_client import DeltaExchangeClient
+          from utils.logger import get_logger
+          
+          logger = get_logger('risk_monitoring')
+          
+          try:
+              if not os.getenv('DELTA_API_KEY'):
+                  print('status=no_data')
+                  print('position_size=0')
+                  print('leverage=0')
+                  print('open_orders=0')
+                  sys.exit(0)
+              
+              config = Config()
+              client = DeltaExchangeClient(config)
+              
+              # Get current position and orders
+              position_info = client.get_position()
+              open_orders = client.get_open_orders()
+              
+              position_size = abs(float(position_info.get('position', {}).get('size', 0)))
+              num_open_orders = len(open_orders)
+              
+              # Get leverage (this might need to be implemented in the client)
+              # For now, we'll use a placeholder
+              leverage = 1  # This should be retrieved from the API
+              
+              # Check limits
+              max_position = float(os.getenv('MAX_POSITION_SIZE', 1000))
+              max_leverage = float(os.getenv('MAX_LEVERAGE', 10))
+              max_orders = int(os.getenv('MAX_OPEN_ORDERS', 5))
+              
+              violations = []
+              
+              if position_size > max_position:
+                  violations.append(f'Position size ({position_size}) exceeds limit ({max_position})')
+              
+              if leverage > max_leverage:
+                  violations.append(f'Leverage ({leverage}) exceeds limit ({max_leverage})')
+              
+              if num_open_orders > max_orders:
+                  violations.append(f'Open orders ({num_open_orders}) exceeds limit ({max_orders})')
+              
+              if violations:
+                  status = 'violation'
+                  logger.warning(f'Risk limit violations: {violations}')
+              else:
+                  status = 'compliant'
+                  logger.info('All risk limits within acceptable ranges')
+              
+              print(f'status={status}')
+              print(f'position_size={position_size}')
+              print(f'leverage={leverage}')
+              print(f'open_orders={num_open_orders}')
+              
+          except Exception as e:
+              logger.error(f'Risk monitoring error: {str(e)}')
+              print('status=error')
+              print('position_size=0')
+              print('leverage=0')
+              print('open_orders=0')
+          " | while read line; do
+            echo "$line" >> $GITHUB_OUTPUT
+          done
+
+  system_status_check:
+    runs-on: ubuntu-latest
+    outputs:
+      system_status: ${{ steps.system.outputs.status }}
+      last_execution: ${{ steps.system.outputs.last_execution }}
+      bot_status: ${{ steps.system.outputs.bot_status }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Check system status
+        id: system
+        run: |
+          # Check last successful workflow run
+          last_run=$(gh run list --workflow=trading-bot.yml --status=success --limit=1 --json=createdAt --jq='.[0].createdAt' 2>/dev/null || echo "unknown")
+          
+          # Check if bot should be running (market hours)
+          current_hour=$(date +%H)
+          current_day=$(date +%u)  # 1=Monday, 7=Sunday
+          
+          if [ "$current_day" -le 5 ] && [ "$current_hour" -ge 9 ] && [ "$current_hour" -lt 17 ]; then
+            expected_status="active"
+          else
+            expected_status="idle"
+          fi
+          
+          # Calculate time since last execution
+          if [ "$last_run" != "unknown" ]; then
+            last_timestamp=$(date -d "$last_run" +%s 2>/dev/null || echo "0")
+            current_timestamp=$(date +%s)
+            time_diff=$((current_timestamp - last_timestamp))
+            
+            # If more than 30 minutes since last run during market hours, flag as issue
+            if [ "$expected_status" = "active" ] && [ "$time_diff" -gt 1800 ]; then
+              system_status="stale"
+            else
+              system_status="healthy"
+            fi
+          else
+            system_status="unknown"
+          fi
+          
+          echo "status=$system_status" >> $GITHUB_OUTPUT
+          echo "last_execution=$last_run" >> $GITHUB_OUTPUT
+          echo "bot_status=$expected_status" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  alert_manager:
+    runs-on: ubuntu-latest
+    needs: [api_health_check, performance_monitoring, risk_limit_monitoring, system_status_check]
+    if: always()
+    
+    steps:
+      - name: Evaluate alert conditions
+        id: alerts
+        run: |
+          # Collect all status information
+          api_status="${{ needs.api_health_check.outputs.api_status }}"
+          performance_status="${{ needs.performance_monitoring.outputs.performance_status }}"
+          risk_status="${{ needs.risk_limit_monitoring.outputs.risk_status }}"
+          system_status="${{ needs.system_status_check.outputs.system_status }}"
+          
+          # Determine overall severity
+          critical_conditions=0
+          warning_conditions=0
+          
+          # Check for critical conditions
+          if [ "$api_status" = "unhealthy" ] || [ "$api_status" = "error" ]; then
+            critical_conditions=$((critical_conditions + 1))
+          fi
+          
+          if [ "$performance_status" = "alert" ]; then
+            critical_conditions=$((critical_conditions + 1))
+          fi
+          
+          if [ "$risk_status" = "violation" ]; then
+            critical_conditions=$((critical_conditions + 1))
+          fi
+          
+          # Check for warning conditions
+          if [ "$api_status" = "degraded" ]; then
+            warning_conditions=$((warning_conditions + 1))
+          fi
+          
+          if [ "$performance_status" = "warning" ]; then
+            warning_conditions=$((warning_conditions + 1))
+          fi
+          
+          if [ "$system_status" = "stale" ]; then
+            warning_conditions=$((warning_conditions + 1))
+          fi
+          
+          # Determine alert level
+          if [ "$critical_conditions" -gt 0 ]; then
+            alert_level="critical"
+            alert_color="15158332"  # Red
+            alert_emoji="🚨"
+          elif [ "$warning_conditions" -gt 0 ]; then
+            alert_level="warning"
+            alert_color="16776960"  # Yellow
+            alert_emoji="⚠️"
+          else
+            alert_level="normal"
+            alert_color="65280"     # Green
+            alert_emoji="✅"
+          fi
+          
+          echo "alert_level=$alert_level" >> $GITHUB_OUTPUT
+          echo "alert_color=$alert_color" >> $GITHUB_OUTPUT
+          echo "alert_emoji=$alert_emoji" >> $GITHUB_OUTPUT
+          echo "critical_count=$critical_conditions" >> $GITHUB_OUTPUT
+          echo "warning_count=$warning_conditions" >> $GITHUB_OUTPUT
+      
+      - name: Send critical alerts
+        if: steps.alerts.outputs.alert_level == 'critical'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          # Prepare alert message
+          message="🚨 CRITICAL ALERT: Delta Trading Bot System Issues Detected"
+          
+          details=""
+          if [ "${{ needs.api_health_check.outputs.api_status }}" = "unhealthy" ]; then
+            details="$details\n• API Health: UNHEALTHY"
+          fi
+          
+          if [ "${{ needs.performance_monitoring.outputs.performance_status }}" = "alert" ]; then
+            details="$details\n• Performance: ALERT (PnL: ${{ needs.performance_monitoring.outputs.current_pnl }}, Drawdown: ${{ needs.performance_monitoring.outputs.drawdown }}%)"
+          fi
+          
+          if [ "${{ needs.risk_limit_monitoring.outputs.risk_status }}" = "violation" ]; then
+            details="$details\n• Risk Limits: VIOLATION"
+          fi
+          
+          # Send Discord notification
+          if [ -n "$DISCORD_WEBHOOK_URL" ]; then
+            curl -H "Content-Type: application/json" \
+                 -X POST \
+                 -d "{
+                   \"embeds\": [{
+                     \"title\": \"$message\",
+                     \"description\": \"$details\",
+                     \"color\": ${{ steps.alerts.outputs.alert_color }},
+                     \"fields\": [
+                       {
+                         \"name\": \"API Status\",
+                         \"value\": \"${{ needs.api_health_check.outputs.api_status }}\",
+                         \"inline\": true
+                       },
+                       {
+                         \"name\": \"Performance\",
+                         \"value\": \"${{ needs.performance_monitoring.outputs.performance_status }}\",
+                         \"inline\": true
+                       },
+                       {
+                         \"name\": \"Risk Status\",
+                         \"value\": \"${{ needs.risk_limit_monitoring.outputs.risk_status }}\",
+                         \"inline\": true
+                       }
+                     ],
+                     \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"
+                   }]
+                 }" \
+                 "$DISCORD_WEBHOOK_URL"
+          fi
+      
+      - name: Send warning alerts
+        if: steps.alerts.outputs.alert_level == 'warning'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -n "$DISCORD_WEBHOOK_URL" ]; then
+            curl -H "Content-Type: application/json" \
+                 -X POST \
+                 -d "{
+                   \"embeds\": [{
+                     \"title\": \"⚠️ Warning: Delta Trading Bot Issues\",
+                     \"description\": \"Non-critical issues detected that require attention\",
+                     \"color\": ${{ steps.alerts.outputs.alert_color }},
+                     \"fields\": [
+                       {
+                         \"name\": \"System Status\",
+                         \"value\": \"${{ needs.system_status_check.outputs.system_status }}\",
+                         \"inline\": true
+                       },
+                       {
+                         \"name\": \"Last Execution\",
+                         \"value\": \"${{ needs.system_status_check.outputs.last_execution }}\",
+                         \"inline\": true
+                       }
+                     ],
+                     \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"
+                   }]
+                 }" \
+                 "$DISCORD_WEBHOOK_URL"
+          fi
+      
+      - name: Log monitoring results
+        run: |
+          echo "=== Monitoring Results ===" >> monitoring.log
+          echo "Timestamp: $(date)" >> monitoring.log
+          echo "API Status: ${{ needs.api_health_check.outputs.api_status }}" >> monitoring.log
+          echo "API Latency: ${{ needs.api_health_check.outputs.api_latency }}ms" >> monitoring.log
+          echo "Performance Status: ${{ needs.performance_monitoring.outputs.performance_status }}" >> monitoring.log
+          echo "Current PnL: ${{ needs.performance_monitoring.outputs.current_pnl }}" >> monitoring.log
+          echo "Risk Status: ${{ needs.risk_limit_monitoring.outputs.risk_status }}" >> monitoring.log
+          echo "System Status: ${{ needs.system_status_check.outputs.system_status }}" >> monitoring.log
+          echo "Alert Level: ${{ steps.alerts.outputs.alert_level }}" >> monitoring.log
+          echo "=========================" >> monitoring.log
+      
+      - name: Upload monitoring logs
+        uses: actions/upload-artifact@v3
+        with:
+          name: monitoring-logs-${{ github.run_number }}
+          path: monitoring.log
+          retention-days: 30
+
+  emergency_shutdown:
+    runs-on: ubuntu-latest
+    needs: [alert_manager, risk_limit_monitoring, performance_monitoring]
+    if: |
+      needs.risk_limit_monitoring.outputs.risk_status == 'violation' ||
+      (needs.performance_monitoring.outputs.risk_level == 'high' && 
+       needs.performance_monitoring.outputs.drawdown < -20)
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Execute emergency shutdown
+        env:
+          DELTA_API_KEY: ${{ secrets.DELTA_API_KEY }}
+          DELTA_API_SECRET: ${{ secrets.DELTA_API_SECRET }}
+          DELTA_BASE_URL: ${{ secrets.DELTA_BASE_URL }}
+        run: |
+          python -c "
+          import os
+          import sys
+          sys.path.append('src')
+          
+          from utils.config import Config
+          from api.delta_client import DeltaExchangeClient
+          from utils.logger import get_logger
+          
+          logger = get_logger('emergency_shutdown')
+          
+          try:
+              config = Config()
+              client = DeltaExchangeClient(config)
+              
+              logger.critical('🚨 EMERGENCY SHUTDOWN TRIGGERED')
+              
+              # Cancel all open orders
+              open_orders = client.get_open_orders()
+              for order in open_orders:
+                  try:
+                      result = client.cancel_order(order.get('id'))
+                      if result.get('success'):
+                          logger.info(f'Cancelled order: {order.get(\"id\")}')
+                      else:
+                          logger.error(f'Failed to cancel order: {order.get(\"id\")}')
+                  except Exception as e:
+                      logger.error(f'Error cancelling order {order.get(\"id\")}: {str(e)}')
+              
+              # Close position if configured to do so
+              emergency_close_position = os.getenv('EMERGENCY_CLOSE_POSITION', 'false').lower() == 'true'
+              
+              if emergency_close_position:
+                  position_info = client.get_position()
+                  position = position_info.get('position', {})
+                  position_size = float(position.get('size', 0))
+                  
+                  if position_size != 0:
+                      side = 'sell' if position_size > 0 else 'buy'
+                      result = client.place_market_order(side, abs(position_size), reduce_only=True)
+                      
+                      if result.get('success'):
+                          logger.info(f'Emergency position close executed: {side} {abs(position_size)}')
+                      else:
+                          logger.error(f'Failed to close position: {result}')
+              
+              logger.critical('Emergency shutdown completed')
+              
+          except Exception as e:
+              logger.error(f'Emergency shutdown error: {str(e)}')
+              sys.exit(1)
+          "
+      
+      - name: Disable trading workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Disable the main trading workflow
+          gh workflow disable trading-bot.yml
+          
+          echo "🛑 Trading workflows have been disabled due to emergency conditions"
+      
+      - name: Send emergency notification
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          message="🚨 EMERGENCY SHUTDOWN EXECUTED"
+          details="The trading bot has been automatically shut down due to critical risk conditions."
+          
+          if [ -n "$DISCORD_WEBHOOK_URL" ]; then
+            curl -H "Content-Type: application/json" \
+                 -X POST \
+                 -d "{
+                   \"embeds\": [{
+                     \"title\": \"$message\",
+                     \"description\": \"$details\",
+                     \"color\": 15158332,
+                     \"fields\": [
+                       {
+                         \"name\": \"Actions Taken\",
+                         \"value\": \"• All open orders cancelled\\n• Trading workflows disabled\\n• Manual intervention required\",
+                         \"inline\": false
+                       }
+                     ],
+                     \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"
+                   }]
+                 }" \
+                 "$DISCORD_WEBHOOK_URL"
+          fi

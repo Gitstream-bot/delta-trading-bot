@@ -1,0 +1,498 @@
+name: Delta Trading Bot Automation
+
+on:
+  schedule:
+    # Run every 15 minutes during market hours (9 AM to 5 PM IST, Mon-Fri)
+    - cron: '*/15 9-17 * * 1-5'
+    # Run every hour during extended hours for monitoring
+    - cron: '0 */1 * * *'
+  
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Execution mode'
+        required: true
+        default: 'analysis'
+        type: choice
+        options:
+          - analysis
+          - paper_trading
+          - live_trading
+          - backtest
+          - health_check
+      
+      strategy:
+        description: 'Trading strategy to use'
+        required: false
+        default: 'moving_average_crossover'
+        type: choice
+        options:
+          - moving_average_crossover
+          - rsi_mean_reversion
+          - bollinger_bands
+          - macd_momentum
+          - multi_strategy
+      
+      symbol:
+        description: 'Trading symbol'
+        required: false
+        default: 'BTCUSD'
+        type: string
+      
+      risk_level:
+        description: 'Risk level (1-5, 1=conservative, 5=aggressive)'
+        required: false
+        default: '2'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '4'
+          - '5'
+
+env:
+  PYTHON_VERSION: '3.11'
+  NODE_VERSION: '18'
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      should_trade: ${{ steps.market_check.outputs.should_trade }}
+      execution_mode: ${{ steps.config.outputs.execution_mode }}
+      strategy: ${{ steps.config.outputs.strategy }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Configure execution parameters
+        id: config
+        run: |
+          # Set execution mode based on input or default to analysis
+          if [ "${{ github.event.inputs.mode }}" != "" ]; then
+            echo "execution_mode=${{ github.event.inputs.mode }}" >> $GITHUB_OUTPUT
+          else
+            echo "execution_mode=analysis" >> $GITHUB_OUTPUT
+          fi
+          
+          # Set strategy
+          if [ "${{ github.event.inputs.strategy }}" != "" ]; then
+            echo "strategy=${{ github.event.inputs.strategy }}" >> $GITHUB_OUTPUT
+          else
+            echo "strategy=moving_average_crossover" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Check market hours and conditions
+        id: market_check
+        env:
+          DELTA_API_KEY: ${{ secrets.DELTA_API_KEY }}
+          DELTA_API_SECRET: ${{ secrets.DELTA_API_SECRET }}
+        run: |
+          python -c "
+          import os
+          import sys
+          from datetime import datetime, timezone
+          import pytz
+          
+          # Check if we have API credentials for live trading
+          has_credentials = bool(os.getenv('DELTA_API_KEY') and os.getenv('DELTA_API_SECRET'))
+          
+          # Check if it's market hours (IST timezone)
+          ist = pytz.timezone('Asia/Kolkata')
+          now = datetime.now(ist)
+          
+          # Market hours: 9 AM to 5 PM IST, Monday to Friday
+          is_market_hours = (
+              now.weekday() < 5 and  # Monday to Friday
+              9 <= now.hour < 17     # 9 AM to 5 PM
+          )
+          
+          # Determine if we should trade
+          execution_mode = '${{ steps.config.outputs.execution_mode }}'
+          should_trade = False
+          
+          if execution_mode in ['analysis', 'health_check']:
+              should_trade = True  # Always allow analysis and health checks
+          elif execution_mode == 'paper_trading':
+              should_trade = True  # Always allow paper trading
+          elif execution_mode in ['live_trading', 'backtest']:
+              should_trade = has_credentials and is_market_hours
+          
+          print(f'should_trade={str(should_trade).lower()}')
+          "
+
+  health_check:
+    runs-on: ubuntu-latest
+    needs: setup
+    if: always()
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Run health checks
+        env:
+          DELTA_API_KEY: ${{ secrets.DELTA_API_KEY }}
+          DELTA_API_SECRET: ${{ secrets.DELTA_API_SECRET }}
+          DELTA_BASE_URL: ${{ secrets.DELTA_BASE_URL }}
+        run: |
+          python -c "
+          import os
+          import sys
+          sys.path.append('src')
+          
+          from utils.config import Config
+          from api.delta_client import DeltaExchangeClient
+          from utils.logger import get_logger
+          
+          logger = get_logger('health_check')
+          
+          try:
+              # Load configuration
+              config = Config()
+              
+              # Test API connectivity
+              if os.getenv('DELTA_API_KEY'):
+                  client = DeltaExchangeClient(config)
+                  health_status = client.health_check()
+                  
+                  if health_status:
+                      logger.info('✅ API health check passed')
+                  else:
+                      logger.error('❌ API health check failed')
+                      sys.exit(1)
+              else:
+                  logger.info('⚠️ No API credentials - skipping API health check')
+              
+              logger.info('✅ All health checks completed successfully')
+              
+          except Exception as e:
+              logger.error(f'❌ Health check failed: {str(e)}')
+              sys.exit(1)
+          "
+      
+      - name: Upload health check logs
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: health-check-logs
+          path: logs/
+          retention-days: 7
+
+  market_analysis:
+    runs-on: ubuntu-latest
+    needs: [setup, health_check]
+    if: needs.setup.outputs.should_trade == 'true'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Run market analysis
+        env:
+          DELTA_API_KEY: ${{ secrets.DELTA_API_KEY }}
+          DELTA_API_SECRET: ${{ secrets.DELTA_API_SECRET }}
+          DELTA_BASE_URL: ${{ secrets.DELTA_BASE_URL }}
+          SYMBOL: ${{ github.event.inputs.symbol || 'BTCUSD' }}
+          STRATEGY: ${{ needs.setup.outputs.strategy }}
+        run: |
+          python scripts/run_analysis.py \
+            --symbol "$SYMBOL" \
+            --strategy "$STRATEGY" \
+            --output-file "analysis_results.json"
+      
+      - name: Upload analysis results
+        uses: actions/upload-artifact@v3
+        with:
+          name: market-analysis-${{ github.run_number }}
+          path: |
+            analysis_results.json
+            logs/
+          retention-days: 30
+
+  trading_execution:
+    runs-on: ubuntu-latest
+    needs: [setup, health_check, market_analysis]
+    if: needs.setup.outputs.should_trade == 'true' && needs.setup.outputs.execution_mode != 'analysis'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Download analysis results
+        uses: actions/download-artifact@v3
+        with:
+          name: market-analysis-${{ github.run_number }}
+      
+      - name: Execute trading strategy
+        env:
+          DELTA_API_KEY: ${{ secrets.DELTA_API_KEY }}
+          DELTA_API_SECRET: ${{ secrets.DELTA_API_SECRET }}
+          DELTA_BASE_URL: ${{ secrets.DELTA_BASE_URL }}
+          EXECUTION_MODE: ${{ needs.setup.outputs.execution_mode }}
+          STRATEGY: ${{ needs.setup.outputs.strategy }}
+          SYMBOL: ${{ github.event.inputs.symbol || 'BTCUSD' }}
+          RISK_LEVEL: ${{ github.event.inputs.risk_level || '2' }}
+          TRADING_ENABLED: ${{ needs.setup.outputs.execution_mode == 'live_trading' }}
+          PAPER_TRADING: ${{ needs.setup.outputs.execution_mode == 'paper_trading' }}
+        run: |
+          python scripts/run_trading.py \
+            --mode "$EXECUTION_MODE" \
+            --strategy "$STRATEGY" \
+            --symbol "$SYMBOL" \
+            --risk-level "$RISK_LEVEL" \
+            --analysis-file "analysis_results.json"
+      
+      - name: Upload trading results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: trading-results-${{ github.run_number }}
+          path: |
+            trading_results.json
+            logs/
+          retention-days: 90
+
+  performance_tracking:
+    runs-on: ubuntu-latest
+    needs: [setup, trading_execution]
+    if: always() && needs.setup.outputs.execution_mode != 'analysis'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Download trading results
+        if: needs.trading_execution.result == 'success'
+        uses: actions/download-artifact@v3
+        with:
+          name: trading-results-${{ github.run_number }}
+      
+      - name: Update performance metrics
+        env:
+          DELTA_API_KEY: ${{ secrets.DELTA_API_KEY }}
+          DELTA_API_SECRET: ${{ secrets.DELTA_API_SECRET }}
+          DELTA_BASE_URL: ${{ secrets.DELTA_BASE_URL }}
+        run: |
+          python scripts/update_performance.py \
+            --results-file "trading_results.json" \
+            --output-file "performance_update.json"
+      
+      - name: Commit performance data
+        if: github.ref == 'refs/heads/main'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          # Add performance data to git (if files exist)
+          if [ -f "performance_update.json" ]; then
+            git add performance_update.json
+          fi
+          
+          if [ -f "logs/performance_metrics.json" ]; then
+            git add logs/performance_metrics.json
+          fi
+          
+          # Commit if there are changes
+          if ! git diff --staged --quiet; then
+            git commit -m "Update performance metrics - Run #${{ github.run_number }}"
+            git push
+          fi
+
+  notification:
+    runs-on: ubuntu-latest
+    needs: [setup, health_check, market_analysis, trading_execution, performance_tracking]
+    if: always()
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Prepare notification data
+        id: notification
+        run: |
+          # Determine overall status
+          if [ "${{ needs.health_check.result }}" = "failure" ]; then
+            echo "status=🔴 FAILED" >> $GITHUB_OUTPUT
+            echo "message=Health check failed" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.trading_execution.result }}" = "failure" ]; then
+            echo "status=🟡 PARTIAL" >> $GITHUB_OUTPUT
+            echo "message=Trading execution failed" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.market_analysis.result }}" = "success" ]; then
+            echo "status=🟢 SUCCESS" >> $GITHUB_OUTPUT
+            echo "message=Analysis completed successfully" >> $GITHUB_OUTPUT
+          else
+            echo "status=⚪ SKIPPED" >> $GITHUB_OUTPUT
+            echo "message=Execution skipped (market closed or no credentials)" >> $GITHUB_OUTPUT
+          fi
+          
+          # Prepare summary
+          echo "summary<<EOF" >> $GITHUB_OUTPUT
+          echo "Mode: ${{ needs.setup.outputs.execution_mode }}" >> $GITHUB_OUTPUT
+          echo "Strategy: ${{ needs.setup.outputs.strategy }}" >> $GITHUB_OUTPUT
+          echo "Symbol: ${{ github.event.inputs.symbol || 'BTCUSD' }}" >> $GITHUB_OUTPUT
+          echo "Run: #${{ github.run_number }}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+      
+      - name: Send Discord notification
+        if: env.DISCORD_WEBHOOK_URL != ''
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          curl -H "Content-Type: application/json" \
+               -X POST \
+               -d '{
+                 "embeds": [{
+                   "title": "Delta Trading Bot - ${{ steps.notification.outputs.status }}",
+                   "description": "${{ steps.notification.outputs.message }}",
+                   "color": 3447003,
+                   "fields": [
+                     {
+                       "name": "Details",
+                       "value": "${{ steps.notification.outputs.summary }}",
+                       "inline": false
+                     }
+                   ],
+                   "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%S.000Z)'"
+                 }]
+               }' \
+               "$DISCORD_WEBHOOK_URL"
+      
+      - name: Send Slack notification
+        if: env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -X POST \
+               -H 'Content-type: application/json' \
+               --data '{
+                 "text": "Delta Trading Bot - ${{ steps.notification.outputs.status }}",
+                 "blocks": [
+                   {
+                     "type": "section",
+                     "text": {
+                       "type": "mrkdwn",
+                       "text": "*Delta Trading Bot Execution*\n${{ steps.notification.outputs.message }}"
+                     }
+                   },
+                   {
+                     "type": "section",
+                     "fields": [
+                       {
+                         "type": "mrkdwn",
+                         "text": "*Mode:*\n${{ needs.setup.outputs.execution_mode }}"
+                       },
+                       {
+                         "type": "mrkdwn",
+                         "text": "*Strategy:*\n${{ needs.setup.outputs.strategy }}"
+                       },
+                       {
+                         "type": "mrkdwn",
+                         "text": "*Symbol:*\n${{ github.event.inputs.symbol || 'BTCUSD' }}"
+                       },
+                       {
+                         "type": "mrkdwn",
+                         "text": "*Run:*\n#${{ github.run_number }}"
+                       }
+                     ]
+                   }
+                 ]
+               }' \
+               "$SLACK_WEBHOOK_URL"
+
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: [notification]
+    if: always()
+    
+    steps:
+      - name: Cleanup old artifacts
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            
+            // Get all artifacts
+            const artifacts = await github.rest.actions.listArtifactsForRepo({
+              owner,
+              repo,
+              per_page: 100
+            });
+            
+            // Delete artifacts older than 30 days
+            const thirtyDaysAgo = new Date();
+            thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+            
+            for (const artifact of artifacts.data.artifacts) {
+              const createdAt = new Date(artifact.created_at);
+              
+              if (createdAt < thirtyDaysAgo) {
+                console.log(`Deleting artifact: ${artifact.name} (${artifact.created_at})`);
+                
+                await github.rest.actions.deleteArtifact({
+                  owner,
+                  repo,
+                  artifact_id: artifact.id
+                });
+              }
+            }
+      
+      - name: Log cleanup completion
+        run: echo "✅ Cleanup completed successfully"
